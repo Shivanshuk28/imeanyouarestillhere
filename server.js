@@ -69,7 +69,7 @@ app.post('/api/v1/hackrx/run', authMiddleware, async (req, res) => {
   }
 });
 
-// Basic health check endpoint
+// Basic health check endpointddd
 app.get('/health', (req, res) => {
   res.status(200).json({ status: 'ok', message: 'Service is running.' });
 });
