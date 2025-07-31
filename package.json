@@ -1,7 +1,7 @@
 {
   "name": "llm-query-retrieval-system",
   "version": "1.0.0",
-  "description": "An LLM-Powered Intelligent Query–Retrieval System with RAG for various document types.",
+  "description": "An LLM-Powered Intelligent Query Retrieval System with RAG for various document types.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -15,11 +15,13 @@
     "PDF",
     "DOCX",
     "Vector Search",
+    "Pinecone",
     "Express"
   ],
   "author": "Your Name/Team Name",
   "license": "MIT",
   "dependencies": {
+    "@pinecone-database/pinecone": "^2.2.0", 
     "axios": "^1.6.8",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",

@@ -1,71 +1,117 @@
-// src/ragSystem.js (Updated processAndAnswer function)
+// src/ragSystem.js
 const axios = require('axios');
+const crypto = require('crypto');
 const documentParser = require('./documentParser');
 const textChunker = require('./textChunker');
 const embeddingService = require('./embeddingService');
-const { getVectorStore } = require('./vectorStore'); // Ensure this is a singleton or managed properly
+const pineconeService = require('./pineconeService');
 const config = require('./config');
 
 const GEMINI_QNA_API_URL = `${config.GEMINI_API_BASE_URL}${config.GEMINI_QNA_MODEL}:generateContent`;
 
-// Helper to estimate token count (very basic, actual LLM tokenizers are more complex)
 const estimateTokens = (text) => {
-  return Math.ceil(text.length / 4); // Roughly 4 characters per token
+  return Math.ceil(text.length / 4);
 };
 
-const processAndAnswer = async (documentUrl, questions) => {
+const getDocumentNamespaceFromUrl = (url) => {
+  return crypto.createHash('sha256').update(url).digest('hex');
+};
+
+const indexDocument = async (documentUrl, namespace) => {
+  console.log(`[RAGSystem - Indexing] Starting indexing for namespace: ${namespace}`);
   const extractedText = await documentParser.getDocumentText(documentUrl);
 
-  // Initialize a new vector store for each request for simplicity.
-  // *** NOTE: This is the primary bottleneck. For production, you'd index documents once. ***
-  const vectorStore = getVectorStore();
-  vectorStore.clear(); // Clear previous data if using a global store
-
-  // 1. Chunk the document
   const chunks = textChunker.chunkText(
     extractedText,
     config.CHUNK_SIZE,
     config.CHUNK_OVERLAP
   );
-  console.log(`[RAGSystem] Document chunked into ${chunks.length} parts.`);
+  console.log(`[RAGSystem - Indexing] Document chunked into ${chunks.length} parts.`);
 
-  // 2. Generate embeddings for all chunks and add to vector store
-  // Process embeddings in batches to avoid rate limits and improve efficiency
-  const BATCH_SIZE = 10; // Adjust based on API limits and network
-  for (let i = 0; i < chunks.length; i += BATCH_SIZE) {
-    const chunkBatch = chunks.slice(i, i + BATCH_SIZE);
+  const vectorsToUpsert = [];
+  const EMBEDDING_BATCH_SIZE = 25; // Reduce batch size slightly to be safer with free tier embedding limits
+
+  for (let i = 0; i < chunks.length; i += EMBEDDING_BATCH_SIZE) {
+    const chunkBatch = chunks.slice(i, i + EMBEDDING_BATCH_SIZE);
     const embeddingPromises = chunkBatch.map(chunk => embeddingService.getEmbedding(chunk));
-    const embeddings = await Promise.all(embeddingPromises); // <--- Parallel embedding within batch
+    const embeddings = await Promise.all(embeddingPromises);
 
     for (let j = 0; j < embeddings.length; j++) {
-      if (embeddings[j] && embeddings[j].length > 0) {
-        await vectorStore.addDocument(chunkBatch[j], embeddings[j]);
+      if (embeddings[j] && embeddings[j].length === config.EMBEDDING_DIMENSION) {
+        vectorsToUpsert.push({
+          id: `${namespace}-chunk-${i + j}`,
+          values: embeddings[j],
+          metadata: { text: chunkBatch[j], original_url: documentUrl, chunk_index: i + j }
+        });
       } else {
-        console.warn(`[RAGSystem] Skipping chunk due to empty or invalid embedding: "${chunkBatch[j].substring(0, 50)}..."`);
+        console.warn(`[RAGSystem - Indexing] Skipping chunk ${i + j} due to invalid embedding.`);
       }
     }
-    // Small delay to prevent hitting rate limits if many chunks
-    await new Promise(resolve => setTimeout(resolve, 100));
+    // Add a delay between batches of embedding calls to avoid rate limits
+    await new Promise(resolve => setTimeout(resolve, config.EMBEDDING_BATCH_DELAY_MS));
   }
-  console.log('[RAGSystem] All chunks embedded and added to vector store.');
+
+  if (vectorsToUpsert.length > 0) {
+    await pineconeService.upsertVectors(vectorsToUpsert, namespace);
+  } else {
+    console.warn(`[RAGSystem - Indexing] No vectors to upsert for namespace: ${namespace}`);
+  }
+  console.log(`[RAGSystem - Indexing] Document namespace: ${namespace} indexing complete.`);
+};
+
+const checkIfDocumentIndexed = async (namespace) => {
+  try {
+    // Try to query with a dummy vector to see if the namespace has any vectors
+    // Using a very small, short query to minimize cost/latency for this check
+    const queryResult = await pineconeService.queryVectors(Array(config.EMBEDDING_DIMENSION).fill(0), namespace, 1);
+    return queryResult.length > 0;
+  } catch (error) {
+    if (error.message.includes('No vectors found in namespace') || error.message.includes('INDEX_DOES_NOT_EXIST')) {
+      console.log(`[RAGSystem - Check] Namespace ${namespace} not found or empty in Pinecone.`);
+      return false;
+    }
+    console.error(`[RAGSystem - Check] Error checking if document ${namespace} is indexed:`, error.message);
+    throw error;
+  }
+};
+
+const processDocumentAndAnswer = async (documentUrl, questions) => {
+  const namespace = getDocumentNamespaceFromUrl(documentUrl);
+
+  const isIndexed = await checkIfDocumentIndexed(namespace);
+
+  if (!isIndexed) {
+    console.log(`[RAGSystem] Document ${documentUrl} (namespace: ${namespace}) not yet indexed. Starting indexing process.`);
+    await indexDocument(documentUrl, namespace);
+    console.log(`[RAGSystem] Indexing complete for ${namespace}. Proceeding to answer questions.`);
+  } else {
+    console.log(`[RAGSystem] Document ${documentUrl} (namespace: ${namespace}) is already indexed. Retrieving directly.`);
+  }
+
+  const allAnswers = [];
+
+  const questionAnswerPromises = questions.map(async (question, index) => { // Added index to apply delay
+    console.log(`[RAGSystem - Querying] Answering question: "${question.substring(0, 50)}..." for document namespace: ${namespace}`);
+
+    // Introduce a delay for each concurrent LLM call to prevent rate limiting
+    // This will sequence the calls a bit, increasing total time but avoiding 429s
+    if (index > 0) { // No need to delay the very first question
+      await new Promise(resolve => setTimeout(resolve, config.LLM_QUERY_CONCURRENT_DELAY_MS));
+    }
 
 
-  // *** OPTIMIZATION: Process questions in parallel ***
-  const questionAnswerPromises = questions.map(async (question) => {
-    console.log(`[RAGSystem] Answering question: "${question}"`);
-
-    // 3. Embed the question
     const queryEmbedding = await embeddingService.getEmbedding(question);
 
-    // 4. Retrieve relevant chunks
-    const relevantChunks = await vectorStore.search(queryEmbedding, config.TOP_K_CHUNKS);
+    const retrievedTexts = await pineconeService.queryVectors(
+      queryEmbedding,
+      namespace,
+      config.TOP_K_CHUNKS
+    );
 
-    // Ensure relevantChunks is an array before joining
-    const context = Array.isArray(relevantChunks) && relevantChunks.length > 0
-      ? relevantChunks.join('\n\n---\n\n')
-      : 'No relevant context found in the document.';
+    const context = Array.isArray(retrievedTexts) && retrievedTexts.length > 0
+      ? retrievedTexts.join('\n\n---\n\n')
+      : 'No relevant context found in the provided document for this question.';
 
-    // 5. Prepare prompt for LLM
     const promptText = `**Context from the document:**
 ---
 ${context}
@@ -84,18 +130,14 @@ You are an expert assistant. Your goal is to carefully read the provided "Contex
 ${question}
 `;
 
-    // Estimate total tokens for prompt
     const estimatedPromptTokens = estimateTokens(promptText);
     if (estimatedPromptTokens > config.MAX_LLM_INPUT_TOKENS) {
-      console.warn(`[RAGSystem] Prompt for question "${question}" is too large (${estimatedPromptTokens} tokens). Truncating or re-evaluating chunking strategy may be needed.`);
-      // In a real system, you might refine chunk selection or summarize context here.
-      // For now, we'll let the LLM handle potential truncation or error.
+      console.warn(`[RAGSystem - Querying] Prompt for question "${question.substring(0, 30)}..." is too large (${estimatedPromptTokens} tokens). This may lead to truncated responses or errors.`);
     }
 
-    // 6. Call Gemini LLM
     let answer = 'Error: Could not get an answer.';
     try {
-      console.log(`[RAGSystem] Sending prompt for "${question.substring(0,30)}..." to Gemini...`);
+      console.log(`[RAGSystem - Querying] Sending prompt for "${question.substring(0, 30)}..." to Gemini...`);
       const geminiResponse = await axios.post(
         GEMINI_QNA_API_URL,
         {
@@ -110,22 +152,23 @@ ${question}
             'Content-Type': 'application/json',
             'X-goog-api-key': process.env.GEMINI_API_KEY
           },
-          timeout: 60000 // 60 seconds timeout for Q&A API call
+          timeout: 60000
         }
       );
       answer = geminiResponse.data.candidates?.[0]?.content?.parts?.[0]?.text || 'No answer generated.';
-      console.log(`[RAGSystem] Received answer for "${question.substring(0,30)}...".`);
+      console.log(`[RAGSystem - Querying] Received answer for "${question.substring(0, 30)}...".`);
     } catch (llmError) {
-      console.error(`[RAGSystem] Error calling Gemini for question "${question}":`, llmError.response?.data || llmError.message);
+      console.error(`[RAGSystem - Querying] Error calling Gemini for question "${question}":`, llmError.response?.data || llmError.message);
       answer = `Error getting answer: ${llmError.response?.data?.error?.message || llmError.message}`;
     }
-    return answer.replace(/^\d+\.\s*/, '').trim(); // Clean up potential numbering from LLM if it adds it
+    return answer.replace(/^\d+\.\s*/, '').trim();
   });
 
-  const allAnswers = await Promise.all(questionAnswerPromises); // Wait for all questions to be answered
+  const rawAnswers = await Promise.all(questionAnswerPromises);
+  allAnswers.push(...rawAnswers);
   return allAnswers;
 };
 
 module.exports = {
-  processAndAnswer
+  processDocumentAndAnswer
 };
