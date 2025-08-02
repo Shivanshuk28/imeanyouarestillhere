@@ -22,7 +22,7 @@ const chunkText = (text, chunkSize, overlap) => {
         splitPoint = lastParagraphEnd + 2;
       } else if (lastSentenceEnd > chunk.length * 0.8) { // Otherwise sentence break
         splitPoint = lastSentenceEnd + 1;
-      } else if (lastLineEnd > chunk.length * 0.8) { // Failing that, line break
+      } else if (lastLineEnd > chunk.length * 0.8) { // Failing that, line breakhdhd
         splitPoint = lastLineEnd + 1;
       }
 
